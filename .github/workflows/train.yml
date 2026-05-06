@@ -1,0 +1,219 @@
+name: Train Wake Word
+
+# Fires whenever a file is pushed to the triggers/ folder
+on:
+  push:
+    paths:
+      - "triggers/**.json"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Read trigger file
+        id: trigger
+        run: |
+          # Find the most recently changed trigger file
+          TRIGGER_FILE=$(git diff-tree --no-commit-id -r --name-only ${{ github.sha }} | grep "^triggers/.*\.json$" | head -1)
+          echo "trigger_file=$TRIGGER_FILE" >> $GITHUB_OUTPUT
+
+          WAKE_WORD=$(python3 -c "import json; d=json.load(open('$TRIGGER_FILE')); print(d['word'])")
+          echo "wake_word=$WAKE_WORD" >> $GITHUB_OUTPUT
+          echo "Trigger file: $TRIGGER_FILE"
+          echo "Wake word: $WAKE_WORD"
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Configure Kaggle credentials
+        run: |
+          mkdir -p ~/.kaggle
+          echo "{\"username\":\"${{ secrets.KAGGLE_USERNAME }}\",\"key\":\"${{ secrets.KAGGLE_KEY }}\"}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Push kernel to Kaggle and trigger run
+        env:
+          WAKE_WORD: ${{ steps.trigger.outputs.wake_word }}
+          GITHUB_TOKEN_SECRET: ${{ secrets.NIYA_GITHUB_TOKEN }}
+        run: |
+          # Create a temp directory for the kernel
+          mkdir -p /tmp/niya-kernel
+
+          # Write the training script
+          cat > /tmp/niya-kernel/trainer.py << 'PYEOF'
+          import os, sys, subprocess, json, base64, re, shutil, urllib.request, tarfile
+          import numpy as np
+          from pathlib import Path
+
+          subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+              "kokoro>=0.9.2", "soundfile", "audiomentations",
+              "onnxruntime", "librosa", "requests"], check=True)
+
+          import librosa, soundfile as sf, onnxruntime as ort, requests
+          import torch, torch.nn as nn
+          from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift
+
+          WAKE_WORD     = os.environ.get("WAKE_WORD", "iris").strip().lower()
+          GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+          MODEL_SLUG    = re.sub(r"[^a-z0-9]+", "_", WAKE_WORD).strip("_")
+          OUTPUT_ONNX   = f"/kaggle/working/{MODEL_SLUG}.onnx"
+          GITHUB_REPO   = "Niyawakeword/niya-wakeword-models"
+          GITHUB_PATH   = f"models/{MODEL_SLUG}.onnx"
+          BASE_MODELS   = "/kaggle/input/niya-base-models"
+          NOISE_DIR     = "/kaggle/input/niya-noise-data"
+          MEL_PATH      = f"{BASE_MODELS}/melspectrogram.onnx"
+          EMBED_PATH    = f"{BASE_MODELS}/embedding_model.onnx"
+          SR=16000; CLIP_LEN=32000; MEL_FRAMES=76; MEL_STRIDE=8
+          EMBED_DIM=96; SEQ_LEN=16; THRESHOLD=0.15; MAX_SCORE=0.25; MAX_RETRIES=3
+
+          print(f"Target word : {WAKE_WORD}")
+          print(f"Model slug  : {MODEL_SLUG}")
+
+          mel_sess   = ort.InferenceSession(MEL_PATH,   providers=["CPUExecutionProvider"])
+          embed_sess = ort.InferenceSession(EMBED_PATH, providers=["CPUExecutionProvider"])
+
+          def embed_clip_onnx(audio_f32):
+              if len(audio_f32) < CLIP_LEN:
+                  audio_f32 = np.concatenate([audio_f32, np.zeros(CLIP_LEN-len(audio_f32), dtype=np.float32)])
+              else:
+                  audio_f32 = audio_f32[:CLIP_LEN]
+              mel_out = mel_sess.run(None, {"input": audio_f32[np.newaxis,:]})[0]
+              mel_frames = mel_out[0,0]
+              embeds=[]; i=0
+              while i+MEL_FRAMES<=len(mel_frames):
+                  win=mel_frames[i:i+MEL_FRAMES].reshape(1,MEL_FRAMES,32,1).astype(np.float32)
+                  emb=embed_sess.run(None,{"input_1":win})[0].flatten()
+                  embeds.append(emb); i+=MEL_STRIDE
+              if len(embeds)<SEQ_LEN: return None
+              windows=[]
+              for s in range(len(embeds)-SEQ_LEN+1):
+                  windows.append(np.stack(embeds[s:s+SEQ_LEN]))
+              return np.stack(windows)
+
+          from kokoro import KPipeline
+          pos_dir=Path("/kaggle/working/positives"); pos_dir.mkdir(exist_ok=True)
+          VOICES=["af_heart","af_bella","af_nicole","af_sarah","am_adam","am_michael","am_fenrir","am_emma","am_george"]
+          SPEEDS=[0.85,1.0,1.15]
+          pipeline=KPipeline(lang_code="a"); count=0
+          for voice in VOICES:
+              for speed in SPEEDS:
+                  try:
+                      for i,(_,_,audio) in enumerate(pipeline(WAKE_WORD,voice=voice,speed=speed)):
+                          sf.write(str(pos_dir/f"{voice}_{speed}_{i}.wav"),audio,SR); count+=1
+                  except Exception as e: print(f"  TTS warning ({voice} {speed}): {e}")
+          print(f"TTS clips: {count}")
+
+          augment=Compose([AddGaussianNoise(min_amplitude=0.001,max_amplitude=0.015,p=0.5),
+              TimeStretch(min_rate=0.9,max_rate=1.1,p=0.3),PitchShift(min_semitones=-2,max_semitones=2,p=0.3)])
+          aug_dir=Path("/kaggle/working/positives_aug"); aug_dir.mkdir(exist_ok=True)
+          for f in pos_dir.glob("*.wav"):
+              audio,_=librosa.load(str(f),sr=SR,mono=True)
+              for j in range(3):
+                  sf.write(str(aug_dir/f"{f.stem}_aug{j}.wav"),augment(samples=audio,sample_rate=SR),SR)
+          all_pos=list(pos_dir.glob("*.wav"))+list(aug_dir.glob("*.wav"))
+
+          neg_dir=Path("/kaggle/working/negatives"); neg_dir.mkdir(exist_ok=True)
+          noise_files=list(Path(NOISE_DIR).rglob("*.wav"))[:500]
+          for nf in noise_files: shutil.copy(str(nf),str(neg_dir/nf.name))
+
+          urllib.request.urlretrieve("https://www.openslr.org/resources/12/dev-clean.tar.gz","/kaggle/working/dev-clean.tar.gz")
+          with tarfile.open("/kaggle/working/dev-clean.tar.gz") as t: t.extractall("/kaggle/working/librispeech/")
+          for ff in list(Path("/kaggle/working/librispeech/").rglob("*.flac"))[:1000]:
+              audio,_=librosa.load(str(ff),sr=SR,mono=True)
+              for k in range(0,len(audio)-CLIP_LEN,CLIP_LEN):
+                  sf.write(str(neg_dir/f"libri_{ff.stem}_{k}.wav"),audio[k:k+CLIP_LEN],SR)
+
+          def extract_features(files):
+              feats=[]
+              for fp in files:
+                  audio,_=librosa.load(str(fp),sr=SR,mono=True)
+                  f=embed_clip_onnx(audio)
+                  if f is not None: feats.append(f)
+              return np.concatenate(feats,axis=0).astype(np.float32) if feats else np.zeros((0,SEQ_LEN,EMBED_DIM),dtype=np.float32)
+
+          X_pos=extract_features(all_pos)
+          X_neg=extract_features(list(neg_dir.glob("*.wav")))
+          X=np.concatenate([X_pos,X_neg])
+          y=np.concatenate([np.ones(len(X_pos)),np.zeros(len(X_neg))]).astype(np.float32)
+
+          class WakeWordModel(nn.Module):
+              def __init__(self):
+                  super().__init__()
+                  self.net=nn.Sequential(nn.Flatten(),nn.Linear(SEQ_LEN*EMBED_DIM,128),nn.ReLU(),nn.Dropout(0.2),nn.Linear(128,1),nn.Sigmoid())
+              def forward(self,x): return self.net(x)
+
+          def train_once(X,y,steps=100000):
+              model=WakeWordModel(); optim=torch.optim.Adam(model.parameters(),lr=1e-3); loss_fn=nn.BCELoss()
+              X_t=torch.tensor(X); y_t=torch.tensor(y).unsqueeze(1); model.train()
+              for step in range(steps):
+                  idx=np.random.choice(len(X_t),64,replace=True)
+                  loss=loss_fn(model(X_t[idx]),y_t[idx]); optim.zero_grad(); loss.backward(); optim.step()
+                  if step%20000==0: print(f"  step {step}  loss={loss.item():.4f}")
+              return model
+
+          def export_onnx(model,path):
+              model.eval()
+              torch.onnx.export(model,torch.zeros(1,SEQ_LEN,EMBED_DIM),path,
+                  input_names=["x"],output_names=["output"],dynamic_axes={"x":{0:"batch"}},opset_version=12)
+
+          def silence_score(path):
+              sess=ort.InferenceSession(path,providers=["CPUExecutionProvider"])
+              return float(sess.run(None,{"x":np.zeros((1,SEQ_LEN,EMBED_DIM),dtype=np.float32)})[0].flatten()[0])
+
+          best_score=1.0; best_path=None
+          for attempt in range(1,MAX_RETRIES+1):
+              print(f"\n── Attempt {attempt}/{MAX_RETRIES} ──")
+              path=f"/kaggle/working/{MODEL_SLUG}_a{attempt}.onnx"
+              model=train_once(X,y); export_onnx(model,path); score=silence_score(path)
+              print(f"Score: {score:.4f}")
+              if score<best_score: best_score=score; best_path=path
+              if score<=THRESHOLD: break
+
+          if best_score>MAX_SCORE:
+              raise RuntimeError(f"TRAINING_FAILED|{WAKE_WORD}|{best_score:.4f}|Score too high.")
+
+          shutil.copy(best_path,OUTPUT_ONNX)
+          with open(OUTPUT_ONNX,"rb") as f: b64=base64.b64encode(f.read()).decode()
+          headers={"Authorization":f"token {GITHUB_TOKEN}","Content-Type":"application/json","User-Agent":"niya-trainer"}
+          api_url=f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+          check=requests.get(api_url,headers=headers)
+          payload={"message":f"Train: {WAKE_WORD} (score={best_score:.4f})","content":b64}
+          if check.status_code==200: payload["sha"]=check.json()["sha"]
+          resp=requests.put(api_url,headers=headers,data=json.dumps(payload))
+          if resp.status_code in(200,201): print(f"Pushed to GitHub!")
+          else: raise RuntimeError(f"GitHub push failed: {resp.status_code}")
+          PYEOF
+
+          # Write kernel metadata
+          cat > /tmp/niya-kernel/kernel-metadata.json << EOF
+          {
+            "id": "${{ secrets.KAGGLE_USERNAME }}/niya-ww-trainer",
+            "title": "NIYA WW Trainer",
+            "code_file": "trainer.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true,
+            "dataset_sources": [
+              "friday20001/niya-noise-data",
+              "friday20001/niya-base-models"
+            ],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "environment_variables": [
+              {"key": "WAKE_WORD",    "value": "$WAKE_WORD"},
+              {"key": "GITHUB_TOKEN", "value": "$GITHUB_TOKEN_SECRET"}
+            ]
+          }
+          EOF
+
+          # Push to Kaggle
+          cd /tmp/niya-kernel
+          kaggle kernels push -p .
+          echo "Kernel pushed to Kaggle successfully!"
