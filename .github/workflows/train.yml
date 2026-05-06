@@ -1,6 +1,5 @@
 name: Train Wake Word
 
-# Fires whenever a file is pushed to the triggers/ folder
 on:
   push:
     paths:
@@ -14,17 +13,29 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Read trigger file
         id: trigger
         run: |
-          # Find the most recently changed trigger file
-          TRIGGER_FILE=$(git diff-tree --no-commit-id -r --name-only ${{ github.sha }} | grep "^triggers/.*\.json$" | head -1)
-          echo "trigger_file=$TRIGGER_FILE" >> $GITHUB_OUTPUT
+          # Try git diff first
+          TRIGGER_FILE=$(git diff --name-only HEAD~1 HEAD -- 'triggers/*.json' | head -1)
 
-          WAKE_WORD=$(python3 -c "import json; d=json.load(open('$TRIGGER_FILE')); print(d['word'])")
-          echo "wake_word=$WAKE_WORD" >> $GITHUB_OUTPUT
+          # Fallback: most recently modified file in triggers/
+          if [ -z "$TRIGGER_FILE" ]; then
+            TRIGGER_FILE=$(ls -t triggers/*.json 2>/dev/null | head -1)
+          fi
+
           echo "Trigger file: $TRIGGER_FILE"
+
+          if [ -z "$TRIGGER_FILE" ]; then
+            echo "ERROR: No trigger file found"
+            exit 1
+          fi
+
+          WAKE_WORD=$(python3 -c "import json; print(json.load(open('$TRIGGER_FILE'))['word'])")
+          echo "wake_word=$WAKE_WORD" >> $GITHUB_OUTPUT
           echo "Wake word: $WAKE_WORD"
 
       - name: Install Kaggle CLI
@@ -41,10 +52,8 @@ jobs:
           WAKE_WORD: ${{ steps.trigger.outputs.wake_word }}
           GITHUB_TOKEN_SECRET: ${{ secrets.NIYA_GITHUB_TOKEN }}
         run: |
-          # Create a temp directory for the kernel
           mkdir -p /tmp/niya-kernel
 
-          # Write the training script
           cat > /tmp/niya-kernel/trainer.py << 'PYEOF'
           import os, sys, subprocess, json, base64, re, shutil, urllib.request, tarfile
           import numpy as np
@@ -189,7 +198,6 @@ jobs:
           else: raise RuntimeError(f"GitHub push failed: {resp.status_code}")
           PYEOF
 
-          # Write kernel metadata
           cat > /tmp/niya-kernel/kernel-metadata.json << EOF
           {
             "id": "${{ secrets.KAGGLE_USERNAME }}/niya-ww-trainer",
@@ -213,7 +221,6 @@ jobs:
           }
           EOF
 
-          # Push to Kaggle
           cd /tmp/niya-kernel
           kaggle kernels push -p .
           echo "Kernel pushed to Kaggle successfully!"
